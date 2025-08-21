@@ -10,6 +10,7 @@ import threading
 import logging
 import socket
 import numpy as np
+import uuid
 
 class Connection:
     def __init__(self, socket, savedata, savedataFile = "", savedataFolder = "", savedataGroup = "dataset"):
@@ -28,6 +29,7 @@ class Connection:
         self.recvImages     = 0
         self.recvWaveforms  = 0
         self.lock           = threading.Lock()
+        self.queue          = []
         self.handlers       = {
             constants.MRD_MESSAGE_CONFIG_FILE:         self.read_config_file,
             constants.MRD_MESSAGE_CONFIG_TEXT:         self.read_config_text,
@@ -36,7 +38,12 @@ class Connection:
             constants.MRD_MESSAGE_TEXT:                self.read_text,
             constants.MRD_MESSAGE_ISMRMRD_ACQUISITION: self.read_acquisition,
             constants.MRD_MESSAGE_ISMRMRD_WAVEFORM:    self.read_waveform,
-            constants.MRD_MESSAGE_ISMRMRD_IMAGE:       self.read_image
+            constants.MRD_MESSAGE_ISMRMRD_IMAGE:       self.read_image,
+            constants.MRD_MESSAGE_ISMRMRD_FEEDBACK:    self.read_feedback,
+            constants.MRD_MESSAGE_ISMRMRD_STORE_DATA_QUERY:       self.read_store_data_query,
+            constants.MRD_MESSAGE_ISMRMRD_STORE_DATA_RESPONSE:    self.read_store_data_response,
+            constants.MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_QUERY:    self.read_retrieve_data_query,
+            constants.MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_RESPONSE: self.read_retrieve_data_response
         }
 
     def create_save_file(self):
@@ -75,7 +82,7 @@ class Connection:
         self.send_text(formatted_contents)
 
     def __iter__(self):
-        while not self.is_exhausted:
+        while not (self.is_exhausted and (len(self.queue) == 0)):
             yield self.next()
 
     def __next__(self):
@@ -88,14 +95,56 @@ class Connection:
         return self.socket.recv(nbytes, socket.MSG_PEEK)
 
     def next(self):
+        # Get next parsed message from either queue or socket, ignoring data storage responses
+
+        # Check queue first
+        for i,item in enumerate(self.queue):
+            if not isinstance(item, (constants.MrdStoreDataResponse, constants.MrdRetrieveDataResponse)):
+                return self.queue.pop(i)
+
+        # Check the socket
         with self.lock:
-            id = self.read_mrd_message_identifier()
+            while True:
+                id = self.read_mrd_message_identifier()
 
-            if (self.is_exhausted == True):
-                return
+                if id is None:
+                    return None
 
-            handler = self.handlers.get(id, lambda: Connection.unknown_message_identifier(id))
-            return handler()
+                handler = self.handlers.get(id, lambda: Connection.unknown_message_identifier(id))
+                item = handler()
+                if isinstance(item, (constants.MrdStoreDataResponse, constants.MrdRetrieveDataResponse)):
+                    logging.debug("connection.next() is adding a data response to queue!")
+                    self.queue.append(item)
+                else:
+                    return item
+
+    def get_data_response(self, responseType, uid):
+        # Check queue first
+        for i,item in enumerate(self.queue):
+            if isinstance(item, responseType):
+                if item.uid == uid:
+                    logging.info("Found a response for UID: %s (%d in self queue)", uid, i)
+                    return self.queue.pop(i)
+
+        # Look through the next few messages on the socket for the response with matching UID
+        maxPeekMessages = 10
+        with self.lock:
+            for i in range(maxPeekMessages):
+                id = self.read_mrd_message_identifier()
+
+                if id is None:
+                    return None
+
+                handler = self.handlers.get(id, lambda: Connection.unknown_message_identifier(id))
+                item = handler()
+
+                if isinstance(item, responseType) and item.uid == uid:
+                    logging.info("Found a response for UID: %s (%d in network queue)", uid, i)
+                    return item
+                else:
+                    logging.debug("get_data_response is adding a non-data-response to queue!")
+                    self.queue.append(item)
+        return None
 
     def shutdown_close(self):
         # Encapsulate shutdown in a try block because the socket may have
@@ -144,6 +193,10 @@ class Connection:
         length_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_LENGTH)
         return constants.MrdMessageLength.unpack(length_bytes)[0]
 
+    def read_mrd_message_attrib_length(self):
+        length_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_ATTRIB_LENGTH)
+        return constants.MrdMessageAttribLength.unpack(length_bytes)[0]
+
     # ----- MRD_MESSAGE_CONFIG_FILE (1) ----------------------------------------
     # This message contains the file name of a configuration file used for 
     # image reconstruction/post-processing.  The file must exist on the server.
@@ -159,8 +212,8 @@ class Connection:
     def read_config_file(self):
         logging.info("<-- Received MRD_MESSAGE_CONFIG_FILE (1)")
         config_file_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_CONFIGURATION_FILE)
-        config_file = constants.MrdMessageConfigurationFile.unpack(config_file_bytes)[0]
-        config_file = config_file.split(b'\x00',1)[0].decode('utf-8')  # Strip off null terminators in fixed 1024 size
+        config_file = constants.MrdMessageConfigurationFile.unpack(config_file_bytes)[0].decode("utf-8")
+        config_file = config_file.split('\x00',1)[0]  # Strip off null terminators in fixed 1024 size
 
         logging.debug("    " + config_file)
         if (config_file == "savedataonly"):
@@ -200,7 +253,7 @@ class Connection:
         logging.info("<-- Received MRD_MESSAGE_CONFIG_TEXT (2)")
         length = self.read_mrd_message_length()
         config = self.read(length)
-        config = config.split(b'\x00',1)[0].decode('utf-8')  # Strip off null teminator
+        config = config.decode("utf-8").split('\x00',1)[0]  # Strip off null teminator
 
         logging.debug("    " + config)
 
@@ -233,7 +286,7 @@ class Connection:
         logging.info("<-- Received MRD_MESSAGE_METADATA_XML_TEXT (3)")
         length = self.read_mrd_message_length()
         metadata = self.read(length)
-        metadata = metadata.split(b'\x00',1)[0].decode('utf-8')  # Strip off null teminator
+        metadata = metadata.decode("utf-8").split('\x00',1)[0]  # Strip off null teminator
 
         if self.savedata is True:
             if self.dset is None:
@@ -253,10 +306,6 @@ class Connection:
 
     def read_close(self):
         logging.info("<-- Received MRD_MESSAGE_CLOSE (4)")
-        logging.info("    Total received acquisitions: %5d", self.recvAcqs)
-        logging.info("    Total received images:       %5d", self.recvImages)
-        logging.info("    Total received waveforms:    %5d", self.recvWaveforms)
-        logging.info("------------------------------------------")
 
         if self.savedata is True:
             if self.dset is None:
@@ -288,7 +337,7 @@ class Connection:
         logging.info("<-- Received MRD_MESSAGE_TEXT (5)")
         length = self.read_mrd_message_length()
         text = self.read(length)
-        text = text.split(b'\x00',1)[0].decode('utf-8')  # Strip off null teminator
+        text = text.decode("utf-8").split('\x00',1)[0]  # Strip off null teminator
         logging.info("    %s", text)
         return text
 
@@ -370,7 +419,7 @@ class Connection:
         else:
             logging.debug("   Attributes: %s", attribute_bytes.decode('utf-8'))
 
-        image = ismrmrd.Image(header_bytes, attribute_bytes.split(b'\x00',1)[0].decode('utf-8'))  # Strip off null teminator
+        image = ismrmrd.Image(header_bytes, attribute_bytes.decode('utf-8').split('\x00',1)[0])  # Strip off null teminator
 
         logging.info("    Image is size %d x %d x %d with %d channels of type %s", image.getHead().matrix_size[0], image.getHead().matrix_size[1], image.getHead().matrix_size[2], image.channels, ismrmrd.get_dtype_from_data_type(image.data_type))
         def calculate_number_of_entries(nchannels, xs, ys, zs):
@@ -421,3 +470,220 @@ class Connection:
 
         return waveform
 
+    # ----- MRD_MESSAGE_ISMRMRD_FEEDBACK (1028) -----------------------------
+    # This message contains real-time feedback data.
+    # Message consists of:
+    #   ID               (   2 bytes, unsigned short)
+    #   Name length      (   4 bytes, uint32_t      )
+    #   Name             (  variable, char          )
+    #   Data length      (   4 bytes, uint32_t      )
+    #   Data             (  variable, char          )
+    def send_feedback(self, name, data):
+        with self.lock:
+            logging.info("--> Sending MRD_MESSAGE_FEEDBACK (1028)")
+            self.socket.send(constants.MrdMessageIdentifier.pack(constants.MRD_MESSAGE_ISMRMRD_FEEDBACK))
+
+            name_with_nul = '%s\0' % name # Add null terminator
+            self.socket.send(constants.MrdMessageLength.pack(len(name_with_nul.encode())))
+            self.socket.send(name_with_nul.encode())
+
+            self.socket.send(constants.MrdMessageLength.pack(ctypes.sizeof(data)))
+            self.socket.send(data)
+
+    def read_feedback(self):
+        logging.info("<-- Received MRD_MESSAGE_FEEDBACK (1028)")
+        nameLength = self.read_mrd_message_length()
+        name = self.read(nameLength)
+        name = name.decode("utf-8").split('\x00',1)[0]  # Strip off null teminator
+
+        dataLength = self.read_mrd_message_length()
+        data = self.read(dataLength)
+
+        logging.info("    Name is %s with %d bytes of data: %s" % (name, dataLength, np.frombuffer(data, dtype=np.uint8)))
+
+        class FeedbackData(ctypes.Structure):
+            _pack_ = 1
+            _fields_ = [
+                ('myBool',   ctypes.c_bool),      #          1 byte
+                ('myInt64s', ctypes.c_int64 *2),  # 2 * 8 = 16 bytes
+                ('myFloat',  ctypes.c_float)      #          4 bytes
+            ]                                     #       = 21 bytes total
+
+        dataStruct = FeedbackData()
+        ctypes.memmove(ctypes.addressof(dataStruct), data, ctypes.sizeof(dataStruct))
+        logging.info("Received feedback struct with data:")
+        logging.info("dataStruct.myBool    is: %s" % dataStruct.myBool)
+        logging.info("dataStruct.myInt64s are: %s" % list(dataStruct.myInt64s))
+        logging.info("dataStruct.myFloats  is: %s" % dataStruct.myFloat)
+
+        return (name, data)
+
+    # ----- MRD_MESSAGE_ISMRMRD_STORE_DATA_QUERY (1030) -----------------------------
+    # This message contains abitrary data to be stored by the client
+    # Message consists of:
+    #   ID               (   2 bytes, unsigned short)
+    #   Unique ID        (  16 bytes, 128-bit label )
+    #   Name length      (   4 bytes, uint32_t      )
+    #   Name             (  variable, char          )
+    #   Data length      (   4 bytes, uint32_t      )
+    #   Data             (  variable, char          )
+    def send_store_data_query(self, storeDataQuery: constants.MrdStoreDataQuery):
+        with self.lock:
+            logging.info("--> Sending MRD_MESSAGE_ISMRMRD_STORE_DATA_QUERY (1030)")
+            logging.info("    UID: %s, Name: %s, Data: %d bytes", storeDataQuery.uid, storeDataQuery.name, len(storeDataQuery.data))
+            self.socket.send(constants.MrdMessageIdentifier.pack(constants.MRD_MESSAGE_ISMRMRD_STORE_DATA_QUERY))
+
+            self.socket.send(storeDataQuery.uid.bytes)
+
+            name_with_nul = '%s\0' % storeDataQuery.name # Add null terminator
+            self.socket.send(constants.MrdMessageLength.pack(len(name_with_nul.encode())))
+            self.socket.send(name_with_nul.encode())
+
+            self.socket.send(constants.MrdMessageLength.pack(len(storeDataQuery.data)))
+            self.socket.send(storeDataQuery.data)
+
+    def read_store_data_query(self) -> constants.MrdStoreDataQuery:
+        logging.info("<-- Received MRD_MESSAGE_ISMRMRD_STORE_DATA_QUERY (1030)")
+
+        uid_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_UUID)
+        uid = uuid.UUID(bytes=uid_bytes)
+
+        nameLength = self.read_mrd_message_length()
+        name = self.read(nameLength)
+        name = name.decode("utf-8").split('\x00',1)[0]  # Strip off null teminator
+
+        dataLength = self.read_mrd_message_length()
+        data = self.read(dataLength)
+
+        storeDataQuery = constants.MrdStoreDataQuery(name, data, uid)
+        logging.info("    UID: %s, Name: %s, Data: %d bytes", storeDataQuery.uid, storeDataQuery.name, len(storeDataQuery.data))
+
+        return storeDataQuery
+
+    # ----- MRD_MESSAGE_ISMRMRD_STORE_DATA_RESPONSE (1031) -----------------------------
+    # This message contains a status response to MRD_MESSAGE_ISMRMRD_STORE_DATA_RESPONSE
+    # Message consists of:
+    #   ID               (   2 bytes, unsigned short)
+    #   Unique ID        (  16 bytes, 128-bit label )
+    #   Status           (   4 bytes, uint32_t      )
+    def send_store_data_response(self, storeDataResponse: constants.MrdStoreDataResponse):
+        with self.lock:
+            logging.info("--> Sending MRD_MESSAGE_ISMRMRD_STORE_DATA_RESPONSE (1031)")
+            logging.info("    UID: %s, Status: %d", storeDataResponse.uid, storeDataResponse.status)
+            self.socket.send(constants.MrdMessageIdentifier.pack(constants.MRD_MESSAGE_ISMRMRD_STORE_DATA_RESPONSE))
+
+            self.socket.send(storeDataResponse.uid.bytes)
+
+            self.socket.send(constants.MrdMessageStatus.pack(storeDataResponse.status))
+
+    def read_store_data_response(self) -> constants.MrdStoreDataResponse:
+        logging.info("<-- Received MRD_MESSAGE_ISMRMRD_STORE_DATA_RESPONSE (1031)")
+
+        uid_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_UUID)
+        uid = uuid.UUID(bytes=uid_bytes)
+
+        status_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_STATUS)
+        status = constants.MrdMessageStatus.unpack(status_bytes)[0]
+
+        storeDataResponse = constants.MrdStoreDataResponse(status, uid)
+        logging.info("    UID: %s, Status: %d", storeDataResponse.uid, storeDataResponse.status)
+        return storeDataResponse
+
+    def store_data(self, name, data):
+        storeDataQuery = constants.MrdStoreDataQuery(name, data, uuid.uuid4())
+
+        self.send_store_data_query(storeDataQuery)
+        res = self.get_data_response(constants.MrdStoreDataResponse, storeDataQuery.uid)
+
+        return res.status
+
+    # ----- MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_QUERY (1032) -----------------------------
+    # This message contains abitrary data to be retrieved from the client
+    # Message consists of:
+    #   ID               (   2 bytes, unsigned short)
+    #   Unique ID        (  16 bytes, 128-bit label )
+    #   Name length      (   4 bytes, uint32_t      )
+    #   Name             (  variable, char          )
+    def send_retrieve_data_query(self, retrieveDataQuery: constants.MrdRetrieveDataQuery):
+        with self.lock:
+            logging.info("--> Sending MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_QUERY (1032)")
+            logging.info("    UID: %s, Name: %s", retrieveDataQuery.uid, retrieveDataQuery.name)
+            self.socket.send(constants.MrdMessageIdentifier.pack(constants.MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_QUERY))
+
+            self.socket.send(retrieveDataQuery.uid.bytes)
+
+            name_with_nul = '%s\0' % retrieveDataQuery.name # Add null terminator
+            self.socket.send(constants.MrdMessageLength.pack(len(name_with_nul.encode())))
+            self.socket.send(name_with_nul.encode())
+
+    def read_retrieve_data_query(self) -> constants.MrdRetrieveDataQuery:
+        logging.info("<-- Received MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_QUERY (1032)")
+
+        uid_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_UUID)
+        uid = uuid.UUID(bytes=uid_bytes)
+
+        nameLength = self.read_mrd_message_length()
+        name = self.read(nameLength)
+        name = name.decode("utf-8").split('\x00',1)[0]  # Strip off null teminator
+
+        retrieveDataQuery = constants.MrdRetrieveDataQuery(name, uid)
+        logging.info("    UID: %s, Name: %s", retrieveDataQuery.uid, retrieveDataQuery.name)
+
+        return retrieveDataQuery
+
+    # ----- MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_RESPONSE (1033) -----------------------------
+    # This message contains a status response to MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_QUERY
+    # Message consists of:
+    #   ID               (   2 bytes, unsigned short)
+    #   Unique ID        (  16 bytes, 128-bit label )
+    #   Status           (   4 bytes, uint32_t      )
+    #   Name length      (   4 bytes, uint32_t      )
+    #   Name             (  variable, char          )
+    #   Data length      (   4 bytes, uint32_t      )
+    #   Data             (  variable, char          )
+    def send_retrieve_data_response(self, retrieveDataResponse: constants.MrdRetrieveDataResponse):
+        with self.lock:
+            logging.info("--> Sending MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_RESPONSE (1033)")
+            logging.info("    UID: %s, Status: %d, Name: %s, Data: %d bytes", retrieveDataResponse.uid, retrieveDataResponse.status, retrieveDataResponse.name, len(retrieveDataResponse.data))
+
+            self.socket.send(constants.MrdMessageIdentifier.pack(constants.MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_RESPONSE))
+
+            self.socket.send(retrieveDataResponse.uid.bytes)
+
+            self.socket.send(constants.MrdMessageStatus.pack(retrieveDataResponse.status))
+
+            name_with_nul = '%s\0' % retrieveDataResponse.name # Add null terminator
+            self.socket.send(constants.MrdMessageLength.pack(len(name_with_nul.encode())))
+            self.socket.send(name_with_nul.encode())
+
+            self.socket.send(constants.MrdMessageLength.pack(len(retrieveDataResponse.data)))
+            self.socket.send(retrieveDataResponse.data)
+
+    def read_retrieve_data_response(self) -> constants.MrdRetrieveDataResponse:
+        logging.info("<-- Received MRD_MESSAGE_ISMRMRD_RETRIEVE_DATA_RESPONSE (1033)")
+
+        uid_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_UUID)
+        uid = uuid.UUID(bytes=uid_bytes)
+
+        status_bytes = self.read(constants.SIZEOF_MRD_MESSAGE_STATUS)
+        status = constants.MrdMessageStatus.unpack(status_bytes)[0]
+
+        nameLength = self.read_mrd_message_length()
+        name = self.read(nameLength)
+        name = name.decode("utf-8").split('\x00',1)[0]  # Strip off null teminator
+
+        dataLength = self.read_mrd_message_length()
+        data = self.read(dataLength)
+
+        retrieveDataResponse = constants.MrdRetrieveDataResponse(status, name, data, uid)
+        logging.info("    UID: %s, Status: %d, Name: %s, Data: %d bytes", retrieveDataResponse.uid, retrieveDataResponse.status, retrieveDataResponse.name, len(retrieveDataResponse.data))
+
+        return retrieveDataResponse
+
+    def retrieve_data(self, name):
+        retrieveDataQuery = constants.MrdRetrieveDataQuery(name, uuid.uuid4())
+
+        self.send_retrieve_data_query(retrieveDataQuery)
+        res = self.get_data_response(constants.MrdRetrieveDataResponse, retrieveDataQuery.uid)
+
+        return res
