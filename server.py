@@ -10,6 +10,7 @@ import importlib
 import os
 import json
 import signal
+import sys
 
 import simplefft
 import invertcontrast
@@ -142,6 +143,7 @@ class Server:
                     connection.send_close()
             else:
                 usedConfig = config
+                sys.path.append("/workspaces/siemens-fire/python_modules")
                 if importlib.util.find_spec(config) is None:
                     logging.error("Could not find config module '%s' -- falling back to default config: %s", config, self.defaultConfig)
                     usedConfig = self.defaultConfig
